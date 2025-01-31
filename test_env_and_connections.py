@@ -2,6 +2,8 @@
 import os
 import requests
 import base64
+from dotenv import load_dotenv
+load_dotenv()  # This loads .env into environment variables
 
 def main():
     print("=== Test Script: Checking Environment Variables ===")
