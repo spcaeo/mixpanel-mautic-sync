@@ -1,3 +1,4 @@
+# mixpanel_daily_profile.py
 import os
 import requests
 import json
@@ -45,3 +46,9 @@ def get_profiles_for_date(input_date):
     data = response.json()
     results = data.get("results", [])
     return results
+
+# For testing purposes
+if __name__ == '__main__':
+    test_date = "2025-01-31"  # change this to the date when the user was created
+    profiles = get_profiles_for_date(test_date)
+    print("Profiles on", test_date, ":\n", json.dumps(profiles, indent=2))

@@ -1,3 +1,7 @@
 python3 -m venv venv
 
 source venv/bin/activate
+
+python sync.py --single 81E04637-ABDA-4162-AFD8-89588B7D98A9
+
+python sync.py --day 2025-01-31

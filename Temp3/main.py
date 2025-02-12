@@ -1,7 +1,8 @@
+# main.py
 import os
 from datetime import datetime
 from mixpanel_daily_profile import get_profiles_for_date
-from mixpanel_events import fetch_user_events
+from Temp3.mixpanel_events import fetch_user_events
 import requests
 
 def main():
