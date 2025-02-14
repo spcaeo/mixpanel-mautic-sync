@@ -5,3 +5,35 @@ source venv/bin/activate
 python sync.py --single 81E04637-ABDA-4162-AFD8-89588B7D98A9
 
 python sync.py --day 2025-01-31
+
+
+python sync.py --single 7F306444-3659-4BB0-8814-4EFCEEE368A4
+
+python sync.py --single 000139.d6fb58378ce64f56bea9e631992d2f4f.0305
+
+python sync.py --single 153A202D-25CC-4CAE-B65A-AB63276F08BE
+
+
+
+pip install -r requirements.txt
+pip freeze > requirements.txt
+
+
+===
+# 1. Show a concise log of recent commits:
+git log --oneline --graph --decorate --all
+
+# 2. See detailed commit history:
+git log
+
+# 3. Check the status of your working directory:
+git status
+
+# 4. Stage all changes:
+git add .
+
+# 5. Commit with a final comment for phase-1:
+git commit -m "Phase-1 complete: Integrated Mixpanel data sync into Mautic with AI-generated personalization and pricing calculations. Ready for next phase enhancements."
+
+# 6. Push the changes to the remote repository:
+git push origin <branch-name>

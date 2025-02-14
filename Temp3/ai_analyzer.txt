@@ -1,0 +1,145 @@
+# ai_analyzer.py
+
+import json
+import openai
+from dotenv import load_dotenv
+from openai import OpenAIError
+from ask_ai import AskAIClient, AIModel
+
+load_dotenv()
+
+class AIAnalyzer:
+    def __init__(self, config_path="openai_config.json"):
+        self.client = AskAIClient()
+        try:
+            with open(config_path, "r") as f:
+                self.config = json.load(f)
+        except Exception as e:
+            print(f"[AIAnalyzer] Error loading config: {e}")
+            self.config = {}
+
+    def truncate_event_data(self, event_data: str) -> str:
+        """
+        Truncates event data while maintaining essential context for rich emails.
+        """
+        try:
+            data = json.loads(event_data)
+            
+            # Keep comprehensive profile properties
+            profile = data.get("profile_properties", {})
+            essential_props = {
+                "firstname": profile.get("firstname", ""),
+                "lastname": profile.get("lastname", ""),
+                "email": profile.get("email", ""),
+                "membership": profile.get("membership", ""),
+                "subscription_status": profile.get("subscription_status", ""),
+                "subscription_name": profile.get("subscription_name", ""),
+                "subscription_cost": profile.get("subscription_cost", ""),
+                "total_entries": profile.get("total_entries", 0),
+                "job_count": profile.get("job_count", 0),
+                "total_hours": profile.get("total_hours", 0),
+                "total_earns": profile.get("total_earns", 0),
+                "user_subscribed": profile.get("user_subscribed", ""),
+                "platform": profile.get("platform", ""),
+                "last_used": profile.get("last_used", ""),
+                "subscription_expire_date": profile.get("subscription_expire_date", ""),
+                "subscription_purchased_date": profile.get("subscription_purchased_date", "")
+            }
+            
+            # Track important event categories for better context
+            events = data.get("user_events", [])
+            event_categories = {
+                "job_management": ["Job Selected", "Create Job Save Button Clicked"],
+                "time_tracking": ["Job Dashboard Start Work At Clicked", "Job Start Work Clicked", "Job Stop Work Clicked"],
+                "entry_management": ["Work Details Entry Updated", "Work Details Entry Screen Open"],
+                "subscription": ["Subscription Selected", "Subscription Plan PURCHASED"],
+                "analysis": ["Reports Tab Option Clicked", "History Tab Option Clicked"]
+            }
+            
+            # Keep track of event types seen
+            event_summary = {cat: 0 for cat in event_categories}
+            job_names = set()
+            
+            filtered_events = []
+            for event in events[:30]:  # Look at last 30 events
+                event_name = event.get("event_name", "")
+                props = event.get("all_event_properties", {})
+                
+                # Track job names
+                if job_name := props.get("job_name"):
+                    job_names.add(job_name)
+                
+                # Categorize event
+                for cat, event_types in event_categories.items():
+                    if event_name in event_types:
+                        event_summary[cat] += 1
+                        if len(filtered_events) < 15:  # Keep up to 15 important events
+                            filtered_event = {
+                                "event_name": event_name,
+                                "properties": {
+                                    "job_name": props.get("job_name", ""),
+                                    "details_title": props.get("details_title", "")
+                                }
+                            }
+                            filtered_events.append(filtered_event)
+            
+            # Add summary data
+            truncated_data = {
+                "profile_properties": essential_props,
+                "event_summary": event_summary,
+                "jobs_used": list(job_names),
+                "recent_events": filtered_events,
+                "analysis": {
+                    "total_jobs": len(job_names),
+                    "has_subscription_activity": event_summary["subscription"] > 0,
+                    "active_time_tracking": event_summary["time_tracking"] > 0,
+                    "uses_analysis_features": event_summary["analysis"] > 0
+                }
+            }
+            
+            result = json.dumps(truncated_data, indent=2)
+            print(f"[AIAnalyzer] Truncated data length: {len(result)} chars")
+            return result
+            
+        except Exception as e:
+            print(f"[AIAnalyzer] Error truncating event data: {e}")
+            return event_data[:3000]
+
+    def summarize_events(self, event_data: str) -> str:
+        """
+        Generates a detailed, personalized email while staying within token limits.
+        """
+        model_str = self.config.get("model", "gpt-4")
+        temperature = self.config.get("temperature", 0.5)
+        max_tokens = self.config.get("max_tokens", 500)
+
+        # Keep your original system content as it produces better results
+        system_content = self.config.get("system_content")
+
+        # Truncate event data to handle token limits
+        truncated_data = self.truncate_event_data(event_data)
+
+        user_content = (
+            f"Based on this Mixpanel data, write a detailed, friendly email:\n\n{truncated_data}\n\n"
+            "Include a proper introduction, feature discussions, and relevant suggestions. "
+            "Make it personal and engaging, following all the guidelines in the system content."
+        )
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content}
+        ]
+
+        try:
+            response = self.client.ask_ai(
+                messages=messages,
+                model=AIModel(model_str),
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            return response.strip()
+
+        except OpenAIError as e:
+            error_msg = str(e)
+            print(f"[AIAnalyzer] OpenAI error: {error_msg}")
+            return f"OpenAI error: {error_msg}"

@@ -1,337 +1,118 @@
-# path: mixpanel_mautic_sync/sync.py
+# sync.py
+
 import os
-import json
-import requests
-import base64
-from datetime import datetime, timedelta, timezone
-from dateutil.parser import parse as parse_date
-
+import requests  # Added this import
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-load_dotenv()
-
-from field_mapping import (
-    FIELD_MAPPING,
-    DATETIME_ALIASES,
-    NUMBER_ALIASES,
-    convert_to_mautic_datetime,
-    convert_to_number,
-    convert_country_code_to_fullname
+from event_retriever import get_event_summary_text
+from ai_analyzer import AIAnalyzer
+from sync_helpers import (
+    fetch_profiles_for_created_date,
+    fetch_profiles_since_last_run,
+    post_mautic_contact,
+    patch_mautic_contact,
+    parse_mautic_id,
+    save_last_run_time,
+    map_mixpanel_to_mautic,
+    get_mixpanel_headers,
+    get_env_var
 )
 
-ERRORS = []
-ERROR_LOG_FILE = "error_logs.json"
-LAST_RUN_FILE = "last_run.json"
-
-
-def log_error(context, message, extra=None):
-    """
-    Log an error to the global ERRORS list.
-    `context`: e.g. "Mautic POST"
-    `message`: short text describing error
-    `extra`: dict with any other details (distinct_id, top_level_data, status_code, response_text...)
-    """
-    ERRORS.append({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "context": context,
-        "message": message,
-        "detail": extra or {}
-    })
-
-
-def write_errors_to_file():
-    """
-    Writes the current ERRORS list to error_logs.json.
-    Overwrites (for clarity) or you could append. 
-    """
-    if not ERRORS:
-        print("[INFO] No errors to log.")
-        return
-    with open(ERROR_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(ERRORS, f, indent=2)
-    print(f"[INFO] Wrote {len(ERRORS)} errors to {ERROR_LOG_FILE}")
-
-
-def get_env_var(key, default=None):
-    return os.getenv(key, default)
-
-
-def load_last_run_time():
-    if os.path.exists(LAST_RUN_FILE):
-        with open(LAST_RUN_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("last_run_time")
-    # default to 1 day ago
-    day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    return day_ago
-
-
-def save_last_run_time(dt_iso):
-    with open(LAST_RUN_FILE, "w") as f:
-        json.dump({"last_run_time": dt_iso}, f)
-
-
-### ========== MIXPANEL LOGIC ==========
-
-def get_mixpanel_headers():
-    mp_secret = get_env_var("MIXPANEL_API_SECRET")
-    if not mp_secret:
-        raise ValueError("MIXPANEL_API_SECRET not found.")
-    creds = base64.b64encode(f"{mp_secret}:".encode()).decode()
-    return {
-        "Authorization": f"Basic {creds}",
-        "Accept": "application/json"
-    }
-
-def fetch_profiles_for_created_date(date_str):
-    mp_project_id = get_env_var("MIXPANEL_PROJECT_ID")
-    if not mp_project_id:
-        raise ValueError("MIXPANEL_PROJECT_ID not found in env")
-
-    where_clause = (
-       f'properties["$created"] >= "{date_str}T00:00:00" '
-       f'and properties["$created"] < "{date_str}T23:59:59"'
-    )
-    url = "https://mixpanel.com/api/2.0/engage"
-    params = {
-        "project_id": mp_project_id,
-        "where": where_clause,
-        "limit": 1000
-    }
-    print(f"[Mixpanel] Fetching profiles CREATED on {date_str}, limit=1000")
-
-    resp = requests.get(url, headers=get_mixpanel_headers(), params=params)
-    if resp.status_code != 200:
-        log_error(
-            "Mixpanel Fetch",
-            f"Error {resp.status_code} when fetching day={date_str}",
-            extra={"response_text": resp.text[:300]}
-        )
-        return []
-    data = resp.json()
-    results = data.get("results", [])
-    profiles = []
-    for r in results:
-        p = r.get("$properties", {})
-        p["distinct_id"] = r.get("$distinct_id")
-        profiles.append(p)
-    print(f"[Mixpanel] Found {len(profiles)} newly created profiles for {date_str}")
-    return profiles
-
-
-def fetch_profiles_since_last_run():
-    last_run_iso = load_last_run_time()
-    mp_project_id = get_env_var("MIXPANEL_PROJECT_ID")
-    if not mp_project_id:
-        raise ValueError("MIXPANEL_PROJECT_ID not found")
-
-    where_clause = f'properties["$last_seen"] >= "{last_run_iso}"'
-    url = "https://mixpanel.com/api/2.0/engage"
-    params = {
-        "project_id": mp_project_id,
-        "where": where_clause,
-        "limit": 100
-    }
-    print(f"[Mixpanel] Incremental fetch updated >= {last_run_iso}")
-    resp = requests.get(url, headers=get_mixpanel_headers(), params=params)
-    if resp.status_code != 200:
-        log_error(
-            "Mixpanel Fetch",
-            f"Error {resp.status_code} for incremental",
-            extra={"response_text": resp.text[:300]}
-        )
-        return []
-    data = resp.json()
-    results = data.get("results", [])
-    profiles = []
-    for r in results:
-        p = r.get("$properties", {})
-        p["distinct_id"] = r.get("$distinct_id")
-        profiles.append(p)
-    print(f"[Mixpanel] Found {len(profiles)} profiles since {last_run_iso}")
-    return profiles
-
-
-def set_mixpanel_property(distinct_id, prop_name, prop_value):
-    mp_token = get_env_var("MIXPANEL_API_TOKEN")
-    if not mp_token:
-        print("[WARN] No MIXPANEL_API_TOKEN set; skipping property set.")
-        return
-    url = "https://api.mixpanel.com/engage#profile-set"
-    data_payload = {
-        "token": mp_token,
-        "$distinct_id": distinct_id,
-        "$set": {
-            prop_name: prop_value
-        }
-    }
-    r = requests.post(url, headers={"Content-Type": "application/json"}, json=[data_payload])
-    if r.status_code == 200:
-        print(f"[Mixpanel] Set {prop_name}={prop_value} for distinct_id={distinct_id}.")
-    else:
-        log_error(
-            "Mixpanel Profile Set",
-            f"Failed to set {prop_name} on {distinct_id}",
-            extra={
-                "status_code": r.status_code,
-                "response_text": r.text[:300]
-            }
-        )
-
-### ========== MAUTIC LOGIC ==========
-
-def get_mautic_auth():
-    user = get_env_var("MAUTIC_USER")
-    pw = get_env_var("MAUTIC_PASSWORD")
-    if not user or not pw:
-        raise ValueError("MAUTIC_USER/MAUTIC_PASSWORD not found.")
-    return (user, pw)
-
-def post_mautic_contact(top_level_data, distinct_id=None):
-    base_url = get_env_var("MAUTIC_BASE_URL")
-    if not base_url:
-        raise ValueError("MAUTIC_BASE_URL missing.")
-    url = f"{base_url}/api/contacts/new"
-
-    print(f"[Mautic] POST {url} data: {top_level_data}")
-    resp = requests.post(
-        url,
-        auth=get_mautic_auth(),
-        headers={"Content-Type": "application/json"},
-        json=top_level_data
-    )
-    if resp.status_code not in (200,201):
-        log_error(
-            "Mautic POST",
-            f"Post error {resp.status_code}",
-            extra={
-                "distinct_id": distinct_id,
-                "mautic_data": top_level_data,
-                "status_code": resp.status_code,
-                "response_text": resp.text[:300]
-            }
-        )
-    return resp
-
-def patch_mautic_contact(mautic_id, top_level_data, distinct_id=None):
-    base_url = get_env_var("MAUTIC_BASE_URL")
-    url = f"{base_url}/api/contacts/{mautic_id}/edit"
-
-    print(f"[Mautic] PATCH {url} data: {top_level_data}")
-    resp = requests.patch(
-        url,
-        auth=get_mautic_auth(),
-        headers={"Content-Type": "application/json"},
-        json=top_level_data
-    )
-    if resp.status_code not in (200,201,404):
-        log_error(
-            "Mautic PATCH",
-            f"Patch error {resp.status_code}",
-            extra={
-                "distinct_id": distinct_id,
-                "mautic_id": mautic_id,
-                "mautic_data": top_level_data,
-                "status_code": resp.status_code,
-                "response_text": resp.text[:300]
-            }
-        )
-    return resp
-
-def parse_mautic_id(mautic_response_json):
-    return mautic_response_json.get("contact", {}).get("id")
-
-### ========== MAPPING LOGIC ==========
-
-def map_mixpanel_to_mautic(mixpanel_dict):
-    mapped = {}
-    for mp_prop, mautic_alias in FIELD_MAPPING.items():
-        if mp_prop in mixpanel_dict:
-            raw_val = mixpanel_dict[mp_prop]
-            if mautic_alias in DATETIME_ALIASES and raw_val:
-                val = convert_to_mautic_datetime(raw_val)
-            elif mautic_alias in NUMBER_ALIASES and raw_val not in (None, ""):
-                val = convert_to_number(raw_val)
-            elif mautic_alias == "country":
-                val = convert_country_code_to_fullname(raw_val)
-            else:
-                val = raw_val
-            mapped[mautic_alias] = val
-
-    mapped["ipAddress"] = mixpanel_dict.get("$ip", "127.0.0.1")
-    last_seen_raw = mixpanel_dict.get("$last_seen","")
-    if last_seen_raw:
-        mapped["lastActive"] = convert_to_mautic_datetime(last_seen_raw)
-    else:
-        mapped["lastActive"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    mapped["overwriteWithBlank"] = ""
-    mapped["owner"] = "1"
-
-    # Ensure email is lowercased
-    if "email" in mapped and isinstance(mapped["email"], str):
-        mapped["email"] = mapped["email"].lower().strip()
-
-    return mapped
-
-
-### ========== MAIN SYNC FUNCTIONS ==========
+load_dotenv()
 
 def do_sync_for_profiles(profiles, update_last_run=False):
     if not profiles:
         print("[SYNC] No profiles to process.")
         return
-
-    # Filter out no/spaceo emails
     filtered = []
     for p in profiles:
-        em = p.get("$email","").strip().lower()
+        em = p.get("$email", "").strip().lower()
         if not em or "spaceo" in em:
             continue
         filtered.append(p)
-
     print(f"[SYNC] After filtering empty/spaceo: {len(filtered)} remain.")
 
-    for prof in filtered:
-        mapped_data = map_mixpanel_to_mautic(prof)
-        distinct_id = prof["distinct_id"]  
-        mautic_id = prof.get("mautic_id")
+    ai_analyzer = AIAnalyzer()
 
-        # If no email, skip
+    for prof in filtered:
+        distinct_id = prof["distinct_id"]
+        mapped_data = map_mixpanel_to_mautic(prof)
+        mapped_data["mixpanel_distinct_id"] = distinct_id
+
+        event_summary_json = get_event_summary_text(
+            distinct_id=distinct_id,
+            days_back=2,
+            short_summary=True,
+            filter_event_names=[],
+            detailed_event_names=[
+                "Job Selected",
+                "Create Job Save Button Clicked",
+                "Job Dashboard Start Work At Clicked",
+                "Job Dashboard Create Work Entry Button Clicked",
+                "Job Dashboard Single Work Entry Clicked",
+                "Subscription Selected",
+                "Subscription Plan PURCHASED",
+                "Pay Period Tab Option Clicked",
+                "Pay Period Single Work Entry Clicked",
+                "Work Details Entry Screen Open"
+            ],
+            detailed_props="custom",
+            global_props="all",
+            no_timestamp=True,
+            exclude_props=[],
+            profile_properties=mapped_data
+        )
+        mapped_data["mixpanel_event_summary"] = event_summary_json
+
+        # Use AI Analyzer to generate a summary - now returns dict with subject, body, error
+        ai_result = ai_analyzer.summarize_events(event_summary_json)
+        
+        # Set current timestamp
+        current_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Map the AI results to the new fields
+        mapped_data["mixpanel_first_email_ts"] = current_ts
+        
+        if ai_result["error"]:
+            mapped_data["mixpanel_first_email_erro"] = ai_result["error"]
+            mapped_data["mixpanel_first_email_subj"] = ""
+            mapped_data["mixpanel_first_email_body"] = ""
+        else:
+            mapped_data["mixpanel_first_email_subj"] = ai_result["subject"]
+            mapped_data["mixpanel_first_email_body"] = ai_result["body"]
+            mapped_data["mixpanel_first_email_erro"] = ""
+
+        # Remove old fields if they exist
+        mapped_data.pop("mixpanel_ai_summary", None)
+        mapped_data.pop("mixpanel_ai_summary_ts", None)
+
+        mautic_id = prof.get("mautic_id")
         if not mapped_data.get("email"):
             continue
 
         if mautic_id:
-            # PATCH
             r_patch = patch_mautic_contact(mautic_id, mapped_data, distinct_id=distinct_id)
             if r_patch.status_code == 404:
-                # fallback => POST
                 r_post = post_mautic_contact(mapped_data, distinct_id=distinct_id)
-                if r_post.status_code in (200,201):
+                if r_post.status_code in (200, 201):
                     try:
                         new_id = parse_mautic_id(r_post.json())
-                        #if new_id:
-                           # set_mixpanel_property(distinct_id, "mautic_id", new_id)
-                    except:
-                        pass
-            elif r_patch.status_code in (200,201):
+                    except Exception as e:
+                        print(f"[ERROR] Failed to parse Mautic ID: {e}")
+            elif r_patch.status_code in (200, 201):
                 print(f"[SYNC] Updated Mautic ID={mautic_id}, email={mapped_data['email']}")
-            # else already logged as error
         else:
-            # POST
             r_post = post_mautic_contact(mapped_data, distinct_id=distinct_id)
-            if r_post.status_code in (200,201):
+            if r_post.status_code in (200, 201):
                 try:
                     new_id = parse_mautic_id(r_post.json())
-                    #if new_id:
-                        # set_mixpanel_property(distinct_id, "mautic_id", new_id)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"[ERROR] Failed to parse Mautic ID: {e}")
 
     if update_last_run:
         new_run_time = datetime.now(timezone.utc).isoformat()
         save_last_run_time(new_run_time)
         print(f"[SYNC] Completed. last_run_time updated => {new_run_time}")
-
 
 def sync_by_day(day_str):
     try:
@@ -351,23 +132,19 @@ def sync_one_user(distinct_id):
     if not mp_project_id:
         print("[ERROR] No MIXPANEL_PROJECT_ID")
         return
-    headers = get_mixpanel_headers()
-    url = "https://mixpanel.com/api/2.0/engage"
-
-    where_opts = [
+    
+    found_profile = None
+    for w in [
         f'properties["distinct_id"] == "{distinct_id}"',
         f'properties["$distinct_id"] == "{distinct_id}"'
-    ]
-    found_profile = None
-    for w in where_opts:
-        params = {"project_id": mp_project_id, "where": w, "limit": 1}
-        r = requests.get(url, headers=headers, params=params)
+    ]:
+        r = requests.get(
+            "https://mixpanel.com/api/2.0/engage",
+            headers=get_mixpanel_headers(),
+            params={"project_id": mp_project_id, "where": w, "limit": 1}
+        )
         if r.status_code != 200:
-            log_error(
-                "Mixpanel Single Fetch",
-                f"Error {r.status_code}",
-                extra={"response_text": r.text[:300]}
-            )
+            print(f"[ERROR] Mixpanel Single Fetch: Error {r.status_code}")
             return
         results = r.json().get("results", [])
         if results:
@@ -375,29 +152,22 @@ def sync_one_user(distinct_id):
             p["distinct_id"] = results[0].get("$distinct_id")
             found_profile = p
             break
-
+    
     if not found_profile:
         print(f"[SYNC] No user found distinct_id={distinct_id}")
         return
-
+    
     do_sync_for_profiles([found_profile], update_last_run=False)
-
-
-### ========== MAIN ENTRY ==========
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Mautic sync with robust error logs.")
+    parser = argparse.ArgumentParser(description="Mautic sync")
     parser.add_argument("--single", help="Distinct ID for one user")
     parser.add_argument("--day", help="YYYY-MM-DD to fetch from '$created' in Mixpanel")
     args = parser.parse_args()
-
     if args.single:
         sync_one_user(args.single)
     elif args.day:
         sync_by_day(args.day)
     else:
         sync_incremental()
-
-    # End: write out any errors
-    write_errors_to_file()

@@ -1,4 +1,4 @@
-# path: mixpanel_mautic_sync/field_mapping.py
+#field_mapping.py
 
 import pycountry
 from dateutil.parser import parse as parse_date
